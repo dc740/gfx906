@@ -1,0 +1,10 @@
+*.o
+*.bc
+*.hipi
+*.hipfb
+*.s
+*.out
+*.out.resolution.txt
+*.so
+out.log
+__pycache__/
