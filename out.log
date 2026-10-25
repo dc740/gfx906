@@ -1,0 +1,5 @@
+hipMalloc(&dA,512) -> 0 (hipSuccess)
+hipMalloc(&dB,512) -> 0 (hipSuccess)
+hipMalloc(&dD,1024) -> 0 (hipSuccess)
+hipMemcpy(dA,hA,512,hipMemcpyHostToDevice) -> 0 (hipSuccess)
+hipMemcpy(dB,hB,512,hipMemcpyHostToDevice) -> 0 (hipSuccess)
