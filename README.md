@@ -13,6 +13,18 @@ Kernel: hipcc --offload-arch=gfx906 -O3 -fPIC -c attn_kernel.hip -o attn_kernel.
 Then load attn.cpp via torch.utils.cpp_extension with the .o in extra_ldflags.
 
 Run test.py / test_d512.py for correctness vs SDPA MATH; bench_dall.py for timings.
+test_variants.py builds + benchmarks every compile-time variant on hardware;
+model_check.py validates the lane->dim map and reductions on CPU (no GPU).
+
+Compile-time switches (defaults shown; -D on the hipcc line to change):
+- USE_DOT2 on (GFX906_NO_DOT2 off): v_dot2_f32_f16 QK dots
+- USE_PKFMA on (GFX906_NO_PKFMA off): fp16x2 PV accumulate
+- USE_RED_DPP on (GFX906_NO_RED_DPP off): quad_perm DPP reduction, SPLIT=4
+- USE_RED_SWIZZLE (opt-in): ds_swizzle_b32 xor reduction instead
+- USE_ILV on (GFX906_NO_ILV off): interleaved lane->dim map (fixes D=128
+  LDS bank conflicts)
+- USE_LDS_XCHG (opt-in): stage partial dots through LDS instead of shuffles
+- TILE_M/TILE_N/DMAX/PTYPE/SPLIT_K/SPLIT_K_128/TILE_M_512/TILE_N_512 as before
 
 ## install into ComfyUI
 

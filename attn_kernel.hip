@@ -17,6 +17,27 @@
 #define USE_PKFMA 1
 #endif
 
+// pair-kernel cross-lane reduction. Default: quad_perm DPP for SPLIT==4 —
+// stays in the register file (~1780 Gxchg/s vs ~962 for ds_bpermute, which is
+// what __shfl_xor lowers to on gfx906, and it does not use the LDS pipe).
+// -DGFX906_NO_RED_DPP -> back to __shfl_xor.
+// -DUSE_RED_SWIZZLE   -> ds_swizzle_b32 xor exchange (compile-time pattern,
+//                        still LDS pipe but no bpermute address math).
+// SPLIT!=4 keeps __shfl_xor either way.
+#if !defined(GFX906_NO_RED_DPP) && !defined(USE_RED_SWIZZLE) && !defined(USE_RED_DPP)
+#define USE_RED_DPP 1
+#endif
+
+// interleaved lane->dim map for the pair kernel: lane sub owns the half2
+// groups {4*(sub + SPLIT*g)} instead of the contiguous slice [sub*DQ, +DQ).
+// A quad's ds_read_b128 then covers consecutive banks; the strided map lands
+// lane sub and sub+2 on the same banks when SPLIT*DQ >= 32 (D=128: 2-way
+// conflict). Pure index permutation - identical math, no shuffles added.
+// -DGFX906_NO_ILV restores the strided map.
+#if !defined(GFX906_NO_ILV) && !defined(USE_ILV)
+#define USE_ILV 1
+#endif
+
 #ifndef TILE_M
 #define TILE_M 64
 #endif
@@ -66,6 +87,39 @@ static __device__ __forceinline__ H2 p2h2(PTYPE x) {
     else return __floats2half2_rn(x, x);
 }
 #endif
+
+// SPLIT-lane xor reduction of a partial dot. Order of preference: quad_perm
+// DPP (SPLIT==4 only, register-only), ds_swizzle_b32 xor, __shfl_xor
+// (ds_bpermute on gfx9). quad_perm ctrls: [2,3,0,1] = 0x4e, [1,0,3,2] = 0xb1.
+#ifdef USE_RED_SWIZZLE
+template<int S>
+static __device__ __forceinline__ float xswz(float v) {
+    // ds_swizzle_b32 xor exchange at distance S (immediate operand)
+    return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), S << 10));
+}
+#endif
+template<int SPLIT>
+static __device__ __forceinline__ float xreduce(float pd) {
+#ifdef USE_RED_DPP
+    if constexpr (SPLIT == 4) {
+        pd += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(pd), 0x4e, 0xf, 0xf, false));
+        pd += __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(pd), 0xb1, 0xf, 0xf, false));
+        return pd;
+    }
+#endif
+#ifdef USE_RED_SWIZZLE
+    pd += xswz<1>(pd);
+    if constexpr (SPLIT >= 4)  pd += xswz<2>(pd);
+    if constexpr (SPLIT >= 8)  pd += xswz<4>(pd);
+    if constexpr (SPLIT >= 16) pd += xswz<8>(pd);
+    if constexpr (SPLIT >= 32) pd += xswz<16>(pd);
+    return pd;
+#endif
+    #pragma unroll
+    for (int s = SPLIT / 2; s > 0; s >>= 1)
+        pd += __shfl_xor(pd, s);
+    return pd;
+}
 
 // q,k,v,o: [B,H,S,D] fp16, contiguous. Requires D % 8 == 0, D <= DMAX.
 template<int DT>
@@ -229,8 +283,17 @@ attn_pair_gfx906(
 {
     constexpr int DH = DE / SPLIT;           // dims per lane
     constexpr int DQ = DH / 2;               // half2 per lane
+#ifdef USE_ILV
+    // interleaved lane->dim map (see top of file); needs DQ % 4 == 0
+    constexpr bool ILV = (DQ % 4 == 0);
+#else
+    constexpr bool ILV = false;
+#endif
     const int sub  = threadIdx.x % SPLIT;    // which d-slice this lane owns
     const int row  = threadIdx.x / SPLIT;
+// lane-local d2 -> half2 index inside a K/V row (and -> uint4 slot for Q/O:
+// LANE_H2 maps d2-space; the uint4 equivalents are qv/ov[sub + SPLIT*g]).
+#define LANE_H2(d2) (ILV ? 4 * sub + 4 * SPLIT * ((d2) >> 2) + ((d2) & 3) : sub * DQ + (d2))
     const int bh   = blockIdx.x;
     const int q0   = blockIdx.y * TILE_M + row;
     __shared__ __align__(16) H2 sK[TILE_N][DE / 2];
@@ -248,10 +311,11 @@ attn_pair_gfx906(
     float acc[DH] = {};
     if (live) {
         const uint4* qv = reinterpret_cast<const uint4*>(
-            q + base + (long)q0 * DE + sub * DH);
+            q + base + (long)q0 * DE + (ILV ? 0 : sub * DH));
         #pragma unroll
         for (int d8 = 0; d8 < DH / 8; ++d8)
-            *reinterpret_cast<uint4*>(&qreg[d8 * 4]) = qv[d8];
+            *reinterpret_cast<uint4*>(&qreg[d8 * 4]) =
+                qv[ILV ? sub + SPLIT * d8 : d8];
     }
 
     float m = -INFINITY, l = 0.f;
@@ -279,7 +343,7 @@ attn_pair_gfx906(
                 float a0 = 0.f, a1 = 0.f;
                 #pragma unroll
                 for (int d2 = 0; d2 < DQ; d2 += 4) {
-                    int d2h = sub * DQ + d2;
+                    int d2h = LANE_H2(d2);
 #ifdef USE_DOT2
                     a0 = dot2(a0, qreg[d2],     sK[i][d2h]);
                     a0 = dot2(a0, qreg[d2 + 2], sK[i][d2h + 2]);
@@ -316,7 +380,7 @@ attn_pair_gfx906(
                 float a0 = 0.f, a1 = 0.f;
                 #pragma unroll
                 for (int d2 = 0; d2 < DQ; d2 += 4) {
-                    int d2h = sub * DQ + d2;
+                    int d2h = LANE_H2(d2);
 #ifdef USE_DOT2
                     a0 = dot2(a0, qreg[d2],     sK[i][d2h]);
                     a0 = dot2(a0, qreg[d2 + 2], sK[i][d2h + 2]);
@@ -336,9 +400,7 @@ attn_pair_gfx906(
 #endif
                 }
                 float pd = a0 + a1;
-                #pragma unroll
-                for (int s = SPLIT / 2; s > 0; s >>= 1)
-                    pd += __shfl_xor(pd, s);
+                pd = xreduce<SPLIT>(pd);
 #endif
                 float sc = pd * scale;
                 p[i] = f2p(sc);
@@ -362,7 +424,7 @@ attn_pair_gfx906(
                 H2 pp = p2h2(p[i]);
                 #pragma unroll
                 for (int d2 = 0; d2 < DQ; ++d2)
-                    hacc[d2] = __hfma2(pp, sV[i][sub * DQ + d2], hacc[d2]);
+                    hacc[d2] = __hfma2(pp, sV[i][LANE_H2(d2)], hacc[d2]);
             }
             #pragma unroll
             for (int d2 = 0; d2 < DQ; ++d2) {
@@ -377,7 +439,7 @@ attn_pair_gfx906(
                 float pif = p2f(pi);
                 #pragma unroll
                 for (int d2 = 0; d2 < DQ; ++d2) {
-                    float2 vf = __half22float2(sV[i][sub * DQ + d2]);
+                    float2 vf = __half22float2(sV[i][LANE_H2(d2)]);
                     acc[2 * d2]     += pif * vf.x;
                     acc[2 * d2 + 1] += pif * vf.y;
                 }
@@ -391,7 +453,7 @@ attn_pair_gfx906(
 
     if (live && l > 0.f) {
         uint4* ov = reinterpret_cast<uint4*>(
-            o + base + (long)q0 * DE + sub * DH);
+            o + base + (long)q0 * DE + (ILV ? 0 : sub * DH));
         float inv = 1.f / l;
         #pragma unroll
         for (int d8 = 0; d8 < DH / 8; ++d8) {
@@ -401,10 +463,11 @@ attn_pair_gfx906(
             for (int e = 0; e < 4; ++e)
                 h[e] = __floats2half2_rn(acc[d8 * 8 + 2 * e] * inv,
                                          acc[d8 * 8 + 2 * e + 1] * inv);
-            ov[d8] = t;
+            ov[ILV ? sub + SPLIT * d8 : d8] = t;
         }
     }
 }
+#undef LANE_H2
 
 
 // D==512 kernel (VAE mid-block): lane owns one KEY in the QK phase (full
