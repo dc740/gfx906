@@ -1,0 +1,17 @@
+diff --git a/gfx906_attn.py b/gfx906_attn.py
+index 44d520d..b56504d 100644
+--- a/gfx906_attn.py
++++ b/gfx906_attn.py
+@@ -38,8 +38,11 @@ def is_gfx906() -> bool:
+ 
+ 
+ def _build_kernel_obj() -> bool:
++    src = _HIP_DIR / "attn_kernel.hip"
+     if _KERNEL_OBJ.is_file():
+-        return True
++        if not src.is_file() or _KERNEL_OBJ.stat().st_mtime >= src.stat().st_mtime:
++            return True
++        _KERNEL_OBJ.unlink()  # stale object vs source - rebuild
+     if _BUILD_FAILED.is_file():
+         return False
+     hipcc = shutil.which("hipcc") or "/opt/rocm/bin/hipcc"
