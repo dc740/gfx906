@@ -8,3 +8,4 @@
 *.so
 out.log
 __pycache__/
+AGENTS.md
