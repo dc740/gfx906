@@ -153,9 +153,50 @@ def check_math():
           " strided + interleaved, odd S, Sq != Skv)")
 
 
+def check_zfill():
+    # attn_tiled_gfx906 USE_ZPAD: the one-shot fill writes every half2 slot in
+    # [de/2, D2) of every tile row exactly once (de % 8 == 0 at the binding).
+    DMAX = 64
+    for de in range(8, DMAX, 8):
+        tail = (DMAX - de) // 8
+        covered = set()
+        for c in range(TILE_N * tail):
+            i, off = c // tail, de // 2 + (c % tail) * 4
+            assert 0 <= i < TILE_N and de // 2 <= off < DMAX // 2
+            for j in range(4):
+                covered.add((i, off + j))
+        want = {(i, h) for i in range(TILE_N) for h in range(de // 2, DMAX // 2)}
+        assert covered == want, (de, want - covered)
+    print("zfill: covers the [de, DMAX) half2 tail of every row exactly once")
+
+
+def check_zpad_math():
+    # USE_ZPAD drops the d2*2<de guards: zero tail in qreg and sK/sV makes the
+    # full-width dot equal the de-dim one, and the PV tail adds 0 to acc slots
+    # the store never writes.
+    rng = np.random.default_rng(2)
+    for de in (8, 24, 40, 56):
+        q = rng.standard_normal((1, 2, 13, de))
+        k = rng.standard_normal((1, 2, 29, de))
+        v = rng.standard_normal((1, 2, 29, de))
+        pad = ((0, 0), (0, 0), (0, 0), (0, 64 - de))
+        qp, kp, vp = np.pad(q, pad), np.pad(k, pad), np.pad(v, pad)
+        sp = qp @ kp.transpose(0, 1, 3, 2) * 0.125
+        pp = np.exp(sp - sp.max(-1, keepdims=True))
+        out_pad = pp @ vp / pp.sum(-1, keepdims=True)
+        sd = q @ k.transpose(0, 1, 3, 2) * 0.125
+        pd = np.exp(sd - sd.max(-1, keepdims=True))
+        ref = pd @ v / pd.sum(-1, keepdims=True)
+        np.testing.assert_allclose(out_pad[..., :de], ref, atol=1e-6)
+        assert np.abs(out_pad[..., de:]).max() == 0  # pv tail stays zero
+    print("zpad math: zero-tail QK dot and PV accumulate == guarded version")
+
+
 if __name__ == "__main__":
     check_maps()
     check_reductions()
     check_banks()
     check_math()
+    check_zfill()
+    check_zpad_math()
     print("all model checks passed")

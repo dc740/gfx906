@@ -16,12 +16,15 @@ VDIR = os.path.join(HERE, "variants")
 os.makedirs(VDIR, exist_ok=True)
 
 VARIANTS = {
-    # name: extra -D flags (default = DPP reduction + interleaved map)
+    # name: extra -D flags (default = DPP reduction + interleaved map +
+    # zpad unguarded reads + vectorized sE staging)
     "default":  "",
     "no_dpp":   "-DGFX906_NO_RED_DPP",                    # __shfl_xor reduction
     "swizzle":  "-DUSE_RED_SWIZZLE",                      # ds_swizzle_b32 xor
     "no_ilv":   "-DGFX906_NO_ILV",                        # strided lane->dim map
-    "all_off":  "-DGFX906_NO_RED_DPP -DGFX906_NO_ILV",    # pre-change kernel
+    "no_zpad":  "-DGFX906_NO_ZPAD",                       # guarded D<64 reads
+    "no_sevec": "-DGFX906_NO_SEVEC",                      # scalar sE reads (D=512)
+    "all_off":  "-DGFX906_NO_RED_DPP -DGFX906_NO_ILV -DGFX906_NO_ZPAD -DGFX906_NO_SEVEC",
     "xchg":     "-DUSE_LDS_XCHG",                         # LDS mailbox reduction
 }
 if len(sys.argv) > 1 and sys.argv[1] == "quick" or os.environ.get("QUICK"):

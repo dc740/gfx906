@@ -23,6 +23,10 @@ Compile-time switches (defaults shown; -D on the hipcc line to change):
 - USE_RED_SWIZZLE (opt-in): ds_swizzle_b32 xor reduction instead
 - USE_ILV on (GFX906_NO_ILV off): interleaved lane->dim map (fixes D=128
   LDS bank conflicts)
+- USE_ZPAD on (GFX906_NO_ZPAD off): zero-filled LDS tail lets the D<64
+  tiled kernel read unguarded ds_read_b128
+- USE_SEVEC on (GFX906_NO_SEVEC off): D=512 score row staged to registers
+  via ds_read_b128 instead of two scalar sweeps
 - USE_LDS_XCHG (opt-in): stage partial dots through LDS instead of shuffles
 - TILE_M/TILE_N/DMAX/PTYPE/SPLIT_K/SPLIT_K_128/TILE_M_512/TILE_N_512 as before
 

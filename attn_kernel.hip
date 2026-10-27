@@ -38,6 +38,27 @@
 #define USE_ILV 1
 #endif
 
+// runtime-D tiled kernel (D < 64): zero-fill the [de, DMAX) tail of every
+// sK/sV row once, so the inner loops run unguarded and LLVM emits
+// ds_read_b128; guarded reads were 160 ds_read_b32 in ISA. qreg tail is
+// already zero-initialized, so tail lanes add 0 to every dot/accumulate.
+// -DGFX906_NO_ZPAD restores the per-element de guards.
+#if !defined(GFX906_NO_ZPAD) && !defined(USE_ZPAD)
+#define USE_ZPAD 1
+#endif
+#ifdef USE_ZPAD
+#define DINBOUNDS(d2) true
+#else
+#define DINBOUNDS(d2) ((d2) * 2 < de)
+#endif
+
+// D512 kernel: stage the row's sE scores into registers with TN/4
+// ds_read_b128 instead of two 16-wide ds_read_b32 sweeps per tile.
+// -DGFX906_NO_SEVEC keeps the scalar reads.
+#if !defined(GFX906_NO_SEVEC) && !defined(USE_SEVEC)
+#define USE_SEVEC 1
+#endif
+
 #ifndef TILE_M
 #define TILE_M 64
 #endif
@@ -154,6 +175,20 @@ attn_tiled_gfx906(
     float m = -INFINITY, l = 0.f;
     const int cpr = de / 8;  // uint4 chunks per K/V row (constexpr when DT>0)
 
+#ifdef USE_ZPAD
+    // zero-fill each row's [de, DMAX) half2 tail once; the unguarded inner
+    // loops read it back as zeros. Complete before the first tile's reads:
+    // the tile load below always syncs before compute.
+    if (de < DMAX) {
+        const int tail = (DMAX - de) / 8;   // uint4 chunks per row tail
+        for (int c = row; c < TILE_N * tail; c += TILE_M) {
+            const int i = c / tail, off = de / 2 + (c % tail) * 4;
+            *reinterpret_cast<uint4*>(&sK[i][off]) = uint4{};
+            *reinterpret_cast<uint4*>(&sV[i][off]) = uint4{};
+        }
+    }
+#endif
+
     for (int n0 = 0; n0 < Skv; n0 += TILE_N) {
         // cooperative load K,V tiles (uint4 = 8 halves each)
         for (int c = row; c < TILE_N * cpr; c += TILE_M) {
@@ -178,7 +213,7 @@ attn_tiled_gfx906(
                 float a0 = 0.f, a1 = 0.f, a2 = 0.f, a3 = 0.f;
                 #pragma unroll
                 for (int d2 = 0; d2 < D2; d2 += 4) {
-                    if (d2 * 2 < de) {
+                    if (DINBOUNDS(d2)) {
 #ifdef USE_DOT2
                         a0 = dot2(a0, qreg[d2],     sK[i][d2]);
                         a1 = dot2(a1, qreg[d2 + 1], sK[i][d2 + 1]);
@@ -223,7 +258,7 @@ attn_tiled_gfx906(
                 H2 pp = p2h2(p[i]);
                 #pragma unroll
                 for (int d2 = 0; d2 < D2; ++d2)
-                    if (d2 * 2 < de)
+                    if (DINBOUNDS(d2))
                         hacc[d2] = __hfma2(pp, sV[i][d2], hacc[d2]);
             }
             #pragma unroll
@@ -239,7 +274,7 @@ attn_tiled_gfx906(
                 PTYPE pi = p[i];
                 #pragma unroll
                 for (int d2 = 0; d2 < D2; ++d2) {
-                    if (d2 * 2 < de) {
+                    if (DINBOUNDS(d2)) {
                         float2 vf = __half22float2(sV[i][d2]);
                         float pif = p2f(pi);
                         acc[2 * d2]     += pif * vf.x;
@@ -271,6 +306,7 @@ attn_tiled_gfx906(
         }
     }
 }
+#undef DINBOUNDS
 
 // split variant: SPLIT lanes share a Q row, each owns DE/SPLIT head dims.
 // fewer VGPRs/lane -> more waves/SIMD -> latency hiding. DE is the head dim.
@@ -299,8 +335,8 @@ attn_pair_gfx906(
     __shared__ __align__(16) H2 sK[TILE_N][DE / 2];
     __shared__ __align__(16) H2 sV[TILE_N][DE / 2];
 #ifdef USE_LDS_XCHG
-    // partial-dot mailbox: [row][i][sub] fp32
-    __shared__ float sP[TILE_M][TILE_N][SPLIT];
+    // partial-dot mailbox: [row][i][sub] fp32; 16B rows when SPLIT==4
+    __shared__ __align__(16) float sP[TILE_M][TILE_N][SPLIT];
 #endif
 
     const long base = (long)bh * Sq * DE;
@@ -373,9 +409,16 @@ attn_pair_gfx906(
             #pragma unroll 8
             for (int i = 0; i < nmax; ++i) {
 #ifdef USE_LDS_XCHG
-                float pd = 0.f;
-                #pragma unroll
-                for (int s = 0; s < SPLIT; ++s) pd += sP[row][i][s];
+                float pd;
+                if constexpr (SPLIT == 4) {
+                    // one ds_read_b128 for the row instead of 4 ds_read_b32
+                    float4 f = *reinterpret_cast<const float4*>(sP[row][i]);
+                    pd = f.x + f.y + f.z + f.w;
+                } else {
+                    pd = 0.f;
+                    #pragma unroll
+                    for (int s = 0; s < SPLIT; ++s) pd += sP[row][i][s];
+                }
 #else
                 float a0 = 0.f, a1 = 0.f;
                 #pragma unroll
@@ -495,7 +538,7 @@ attn_d512_gfx906(
     const int q0   = blockIdx.y * TM + row;
     __shared__ __align__(16) H2 sQ[TM][DQ + 8];
     __shared__ __align__(16) H2 sKV[TN][DQ + 8];  // pad: bank rotation
-    __shared__ float sE[TM][TN];                  // scaled scores
+    __shared__ __align__(16) float sE[TM][TN];    // scaled scores, 16B rows
 
     const long base = (long)bh * Sq * DE;
     const long bkv  = (long)bh * Skv * DE;
@@ -573,10 +616,23 @@ attn_d512_gfx906(
 
         // softmax + V phase: lane owns dims {TN*4*j + sub*4 .. +3} half2s
         if (live) {
+#ifdef USE_SEVEC
+            // scores row -> registers: TN/4 ds_read_b128 broadcasts replace the
+            // two per-element ds_read_b32 sweeps below. TN divides 512, so
+            // TN % 4 == 0 for every sane tile config.
+            float se[TN];
+            #pragma unroll
+            for (int i4 = 0; i4 < TN; i4 += 4)
+                *reinterpret_cast<float4*>(&se[i4]) =
+                    *reinterpret_cast<const float4*>(sE[row] + i4);
+#define SE(i) se[i]
+#else
+#define SE(i) sE[row][i]
+#endif
             float m_tile = -INFINITY;
             #pragma unroll
             for (int i = 0; i < TN; ++i)
-                if (i < nmax) m_tile = fmaxf(m_tile, sE[row][i]);
+                if (i < nmax) m_tile = fmaxf(m_tile, SE(i));
             float m_new = fmaxf(m, m_tile);
             float rs = (l > 0.f) ? __expf(m - m_new) : 0.f;
             float psum = 0.f;
@@ -586,7 +642,7 @@ attn_d512_gfx906(
             H2 hacc[DH / 2] = {};
             #pragma unroll 4
             for (int i = 0; i < nmax; ++i) {
-                float e = __expf(sE[row][i] - m_new);
+                float e = __expf(SE(i) - m_new);
                 psum += e;
                 H2 ee = __floats2half2_rn(e, e);
                 #pragma unroll
@@ -607,7 +663,7 @@ attn_d512_gfx906(
 #else
             #pragma unroll 4
             for (int i = 0; i < nmax; ++i) {
-                float e = __expf(sE[row][i] - m_new);
+                float e = __expf(SE(i) - m_new);
                 psum += e;
                 #pragma unroll
                 for (int d2 = 0; d2 < DH / 2; d2 += 4) {
@@ -632,6 +688,7 @@ attn_d512_gfx906(
         }
         __syncthreads();
     }
+#undef SE
 
     if (live && l > 0.f) {
         // acc[8j..8j+7] holds dims (TN*4*j + sub*4 .. +3)*2 -> uint4 j*TN+sub
