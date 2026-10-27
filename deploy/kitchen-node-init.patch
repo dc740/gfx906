@@ -1,0 +1,12 @@
+--- a/__init__.py
++++ b/__init__.py
+@@ -1,6 +1,9 @@
+ from . import gfx906_attention as _gfx906_attention
+ _gfx906_attention.install()
+ 
++from . import gfx906_kitchen as _gfx906_kitchen  # gfx906 fp16 conv3d for the VAE
++_gfx906_kitchen.install()
++
+ from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+ 
+ WEB_DIRECTORY = "./web/js"
