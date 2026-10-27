@@ -40,3 +40,21 @@ Each ships `hip_attn/` (kernel + prebuilt `.o`) and `gfx906_attn.py`, which
 lazy-loads on gfx906 only: rebuilds the `.o` via hipcc if missing, links it
 through torch cpp_extension, and caches the module. Non-gfx906 machines and
 ineligible shapes (dtype/head_dim/masks) fall back to stock attention.
+
+## conv3d backend for comfy_kitchen (VAE decode)
+
+`gfx906_kitchen.py` + `hip_conv/` implement a `gfx906` backend registered into
+comfy_kitchen's registry, serving fp16_conv3d for the SeedVR2 VAE decoder -
+comfy_kitchen's stock HIP manifest has no gfx906 ops at all, so the VAE decode
+otherwise runs the eager NCDHW path (~95min of a ~2h batch).
+
+Deploy to your ComfyUI node:
+
+    scp -r deploy/gfx906_kitchen.py deploy/hip_conv \
+        <server>:<comfyui-node-path>/comfy/ComfyUI/custom_nodes/ComfyUI-SeedVR2-LongVideo/
+    # then apply deploy/kitchen-node-init.patch to the node's __init__.py
+    # so install() runs at node import on gfx906 machines
+
+Requires comfy_kitchen (pip) installed in the ComfyUI venv and a gfx906 GPU;
+anything outside the envelope (C/K not multiples of 8, non-fp16, odd strides)
+falls back to the stock torch path.
