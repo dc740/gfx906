@@ -30,6 +30,17 @@ Compile-time switches (defaults shown; -D on the hipcc line to change):
 - USE_LDS_XCHG (opt-in): stage partial dots through LDS instead of shuffles
 - TILE_M/TILE_N/DMAX/PTYPE/SPLIT_K/SPLIT_K_128/TILE_M_512/TILE_N_512 as before
 
+## measured (test_variants.py, hardware)
+
+S=4096, B=1, fp16 - default flags vs everything disabled:
+
+| head_dim | defaults on | all flags off |
+|---|---|---|
+| D=64 | 5.98 ms | 6.38 ms |
+| D=128 | 10.63 ms | 14.44 ms |
+
+D=128's delta is mostly USE_ILV removing the 2-way LDS bank conflict.
+
 ## install into ComfyUI
 
 Vendored, zero extra steps: clone the patched nodes into `custom_nodes/`:
@@ -58,3 +69,7 @@ Deploy to your ComfyUI node:
 Requires comfy_kitchen (pip) installed in the ComfyUI venv and a gfx906 GPU;
 anything outside the envelope (C/K not multiples of 8, non-fp16, odd strides)
 falls back to the stock torch path.
+
+Status: hardware-validated on gfx906 - 17/17 test_conv3d.py cases correct vs
+fp32 torch conv3d. In-node deployment is up; real-decode end-to-end timing
+still pending.
