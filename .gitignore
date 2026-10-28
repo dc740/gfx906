@@ -9,3 +9,4 @@
 out.log
 __pycache__/
 AGENTS.md
+.session-state
