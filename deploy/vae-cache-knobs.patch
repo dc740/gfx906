@@ -1,0 +1,40 @@
+--- a/comfy/ldm/seedvr/vae.py	2026-11-01 01:21:38.169229170 +0100
++++ b/comfy/ldm/seedvr/vae.py	2026-11-01 01:21:38.172229172 +0100
+@@ -35,6 +35,7 @@
+ import collections
+ import dataclasses
+ import math
++import os
+ from enum import Enum
+ 
+ import comfy.model_management
+@@ -43,6 +44,9 @@
+ import comfy_kitchen
+ 
+ _CL = torch.channels_last_3d
++# SEEDVR2_VAE_PLAIN_CACHES=1: keep temporal-cache tails as plain fp16 on the GPU - no int8
++# ConvRot packing, no pinned host offload (VRAM-costly but measurably faster where VRAM is free).
++_PLAIN_CACHES = bool(os.environ.get("SEEDVR2_VAE_PLAIN_CACHES"))
+ 
+ 
+ def _ck_eligible(x):
+@@ -310,7 +314,8 @@
+ 
+     def _packable(self, value):
+         return (
+-            torch.is_tensor(value)
++            not _PLAIN_CACHES
++            and torch.is_tensor(value)
+             and value.dim() == 5
+             and value.is_cuda
+             and value.is_contiguous(memory_format=_CL)
+@@ -414,7 +419,8 @@
+ def _offload_caches_for(frame_pixels):
+     """Whether a pass over this frame area keeps its packed caches in host memory: when there is
+     room for them, reclaiming RAM from inactive models if needed."""
+-    return comfy.model_management.ensure_pin_budget(frame_pixels * SEEDVR2_CACHE_BYTES_PER_FRAME_PIXEL, evict_active=False)
++    return (not _PLAIN_CACHES
++            and comfy.model_management.ensure_pin_budget(frame_pixels * SEEDVR2_CACHE_BYTES_PER_FRAME_PIXEL, evict_active=False))
+ 
+ 
+ class MemoryState(Enum):
