@@ -1,0 +1,12 @@
+--- a/comfy/ldm/seedvr/vae.py
++++ b/comfy/ldm/seedvr/vae.py
+@@ -1266,7 +1266,8 @@
+     spatial_downsample_factor = BYTEDANCE_VAE_SPATIAL_DOWNSAMPLE
+     temporal_downsample_factor = BYTEDANCE_VAE_TEMPORAL_DOWNSAMPLE
+     slicing_sample_min_size = BYTEDANCE_SLICING_SAMPLE_MIN
+-    slicing_latent_min_size = BYTEDANCE_SLICING_SAMPLE_MIN // BYTEDANCE_VAE_TEMPORAL_DOWNSAMPLE
++    slicing_latent_min_size = int(os.environ.get(
++        "SEEDVR2_VAE_SLICE_MIN", BYTEDANCE_SLICING_SAMPLE_MIN // BYTEDANCE_VAE_TEMPORAL_DOWNSAMPLE))
+ 
+     def __init__(self):
+         super().__init__()
