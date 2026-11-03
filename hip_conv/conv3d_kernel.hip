@@ -73,40 +73,68 @@ conv3d_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
 #pragma unroll
         for (int j = 0; j < TN; ++j) acc[i][j] = 0.f;
 
+    // m -> voxel offsets, staged once in LDS: the runtime int divisions of
+    // the (z,p,q) decomposition were the dominant stall (a GCN int div is a
+    // ~20-instr sequence on the load-issue path of every staged element).
+    // mbase[m] packs input and output base offsets as two int64 in a uint4;
+    // roff[m] is the residual base.
+    __shared__ uint4 mbase[BM];
+    __shared__ long roff[BM];
+    for (int m = tid; m < BM; m += NTHREADS) {
+        const long ml = m0 + m;
+        long io = 0, oo = 0, ro = 0;
+        if (ml < M) {
+            int mm = (int)ml;              // M < 2^31 (wrapper declines bigger)
+            const int q = mm % Q; mm /= Q;
+            const int p = mm % P; mm /= P;
+            const int z = mm % Z; mm /= Z;
+            io = (long)mm * xsn + (long)(z * sd) * xsd
+               + (long)(p * sh) * xsh + (long)(q * sw) * xsw;
+            oo = (long)mm * osn + (long)z * osz + (long)p * osp
+               + (long)q * osq;
+            ro = (long)mm * rsn + (long)z * rsz + (long)p * rsp
+               + (long)q * rsq;
+        }
+        mbase[m] = make_uint4((unsigned)io, (unsigned)(io >> 32),
+                              (unsigned)oo, (unsigned)(oo >> 32));
+        roff[m] = ro;
+    }
+    // tid % GPK is loop-invariant (NTHREADS % GPK == 0): each thread stages
+    // the same 8-half group of every tile row, so its tap (c0,t,r,s) is
+    // computed once per k-tile instead of once per staged element.
+    const int g0 = tid & (GPK - 1);
+    __syncthreads();
+
     for (int i0 = 0; i0 < KG; i0 += BK) {
+        const int gi = i0 + g0 * 8;
+        const bool kok = gi < KG;
+        long tap_off = 0;
+        if (kok) {
+            const int c0 = gi % C;
+            const int tap = gi / C;
+            const int t = tap / RS;
+            const int r = (tap % RS) / S;
+            const int s = tap % S;
+            tap_off = (long)t * xsd + (long)r * xsh + (long)s * xsw + c0;
+        }
         // ---- stage A: BM voxels x BK reduction halves ---------------------
         for (int idx = tid; idx < BM * GPK; idx += NTHREADS) {
             const int m = idx / GPK;
-            const int g = idx % GPK;
-            const int gi = i0 + g * 8;
             uint4 v = {0, 0, 0, 0};
-            const long ml = m0 + m;
-            if (ml < M && gi < KG) {
-                const int c0 = gi % C;
-                const int tap = gi / C;
-                const int t = tap / RS;
-                const int r = (tap % RS) / S;
-                const int s = tap % S;
-                int mm = (int)ml;              // M < 2^31 (wrapper declines bigger)
-                const int q = mm % Q; mm /= Q;
-                const int p = mm % P; mm /= P;
-                const int z = mm % Z; mm /= Z;
-                const long off = (long)mm * xsn + (long)(z * sd + t) * xsd
-                               + (long)(p * sh + r) * xsh
-                               + (long)(q * sw + s) * xsw + c0;
+            if (m0 + m < M && kok) {
+                const uint4 b = mbase[m];
+                const long off = ((long)b.y << 32 | b.x) + tap_off;
                 v = ldg128(x + off);
             }
-            *reinterpret_cast<uint4*>(&As[m][(g ^ (m & (GPK - 1))) * 8]) = v;
+            *reinterpret_cast<uint4*>(&As[m][(g0 ^ (m & (GPK - 1))) * 8]) = v;
         }
         // ---- stage B: BN out-channels x BK reduction halves ----------------
         for (int idx = tid; idx < BN * GPK; idx += NTHREADS) {
             const int n = idx / GPK;
-            const int g = idx % GPK;
-            const int gi = i0 + g * 8;
             uint4 v = {0, 0, 0, 0};
-            if (n0 + n < K && gi < KG)
+            if (n0 + n < K && kok)
                 v = ldg128(w + (long)(n0 + n) * KG + gi);
-            *reinterpret_cast<uint4*>(&Bs[n][(g ^ (n & (GPK - 1))) * 8]) = v;
+            *reinterpret_cast<uint4*>(&Bs[n][(g0 ^ (n & (GPK - 1))) * 8]) = v;
         }
         __syncthreads();
 
@@ -152,14 +180,11 @@ conv3d_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
 
 #pragma unroll
     for (int i = 0; i < TM; ++i) {
-        const long ml = m0 + ty * TM + i;
-        if (ml >= M) break;
-        int mm = (int)ml;
-        const int q = mm % Q; mm /= Q;
-        const int p = mm % P; mm /= P;
-        const int z = mm % Z; mm /= Z;
-        const long obase = mm * osn + (long)z * osz + (long)p * osp
-                         + (long)q * osq + ncol;
+        const int m = ty * TM + i;
+        if (m0 + m >= M) break;
+        const uint4 b = mbase[m];
+        const long obase = ((long)b.w << 32 | b.z) + ncol;
+        const long rb = roff[m] + ncol;
         if (nfull) {
             __half2 o[TN / 2];
 #pragma unroll
@@ -167,9 +192,7 @@ conv3d_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
                 float v0 = acc[i][j] + biasf[j];
                 float v1 = acc[i][j + 1] + biasf[j + 1];
                 if (res != nullptr) {
-                    const long rb = mm * rsn + (long)z * rsz + (long)p * rsp
-                                  + (long)q * rsq + ncol + j;
-                    const __half2 h = *reinterpret_cast<const __half2*>(res + rb);
+                    const __half2 h = *reinterpret_cast<const __half2*>(res + rb + j);
                     const float2 rf = __half22float2(h);
                     v0 += rf.x;
                     v1 += rf.y;
@@ -184,9 +207,7 @@ conv3d_kernel(const __half* __restrict__ x, const __half* __restrict__ w,
                 if (kk_ >= K) break;
                 float v = acc[i][j] + biasf[j];
                 if (res != nullptr) {
-                    const long rb = mm * rsn + (long)z * rsz + (long)p * rsp
-                                  + (long)q * rsq + kk_;
-                    v += __half2float(res[rb]);
+                    v += __half2float(res[rb + j]);
                 }
                 out[obase + j] = __float2half(v);
             }
