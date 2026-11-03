@@ -12,3 +12,7 @@ AGENTS.md
 .session-state
 .aider*
 .pi/
+/conv_pk_bench.py
+/conv_prof.py
+/conv_roofline.py
+/conv_var_bench.py

@@ -12,9 +12,10 @@ first eligible call; off gfx906 nothing is installed.
 Optionally (SEEDVR2_GFX906_VAE=1) the same kernel also backs the SeedVR2 VAE
 mid-block self-attention (single head, head_dim=channels=512, S=h*w per
 frame): ``vae_attention()`` is wrapped so that when it would select the stock
-``normal_attention`` (slice_attention) path, eligible fp16/bf16 calls run the
-kernel instead, which streams K/V tiles and never allocates the S*S score
-matrix slice_attention risks on untiled 4K frames.
+``normal_attention`` (slice_attention) or ``pytorch_attention`` path, eligible
+fp16/bf16 calls run the kernel instead, which streams K/V tiles and never
+allocates the S*S score matrix those paths materialize (math is the only SDPA
+backend on gfx906; S=latent h*w reaches 16K at 1024px decode tiles).
 """
 
 import logging
@@ -78,11 +79,12 @@ def _container_attn(q, k, v, heads, mask=None, attn_precision=None,
     return out.transpose(1, 2).reshape(b, -1, heads * out.shape[-1])
 
 
-def _vae_attn(q, k, v):
+def _vae_attn(q, k, v, fallback):
     """Drop-in for ``normal_attention`` ([b, c, h, w] -> same shape).
 
     Eligible calls (CUDA fp16/bf16, c == 512) go through the gfx906 kernel as
-    one [b, 1, h*w, c] fp16 attention; anything else uses the stock function.
+    one [b, 1, h*w, c] fp16 attention; anything else uses ``fallback``, the
+    function the factory originally selected.
     """
     mod = None
     if (q.is_cuda and q.dtype in (torch.float16, torch.bfloat16)
@@ -90,7 +92,7 @@ def _vae_attn(q, k, v):
             and q.shape[1] == 512):
         mod = gfx906_attn.load_attention()
     if mod is None:
-        return _stock_normal_attention(q, k, v)
+        return fallback(q, k, v)
     b, c, h, w = q.shape
     out_dtype = q.dtype
     qt, kt, vt = q, k, v
@@ -103,13 +105,14 @@ def _vae_attn(q, k, v):
     try:
         out = mod.attn(qt, kt, vt, c ** -0.5)
     except Exception:  # noqa: BLE001 - never take down VAE decode
-        logger.warning("gfx906 VAE attention failed; using slice attention")
-        return _stock_normal_attention(q, k, v)
+        logger.warning("gfx906 VAE attention failed; using %s",
+                       getattr(fallback, "__name__", fallback))
+        return fallback(q, k, v)
     return out.squeeze(1).transpose(1, 2).reshape(b, c, h, w)
 
 
 def _install_vae_hook():
-    """Wrap ``vae_attention()`` so its slice path is routed to the kernel."""
+    """Wrap ``vae_attention()`` so its non-accelerated paths route to the kernel."""
     global _stock_normal_attention
     try:
         from comfy.ldm.modules.diffusionmodules import model as _model
@@ -119,13 +122,16 @@ def _install_vae_hook():
     if _stock_normal_attention is not None:
         return
     _stock_normal_attention = _model.normal_attention
+    # Intercept only the slice and PyTorch paths; leave other backends alone.
+    intercepted = {_model.normal_attention,
+                   getattr(_model, "pytorch_attention", None)}
     orig_factory = _model.vae_attention
 
     def factory():
         fn = orig_factory()
-        if fn is not _stock_normal_attention:
-            return fn  # xformers/pytorch path selected - leave it alone
-        return _vae_attn
+        if fn not in intercepted:
+            return fn  # xformers path selected - leave it alone
+        return lambda q, k, v: _vae_attn(q, k, v, fn)
 
     _model.vae_attention = factory
     logger.info("gfx906 tiled attention installed (VAE mid-block, D=512)")

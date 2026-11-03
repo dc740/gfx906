@@ -52,12 +52,16 @@ lazy-loads on gfx906 only: rebuilds the `.o` via hipcc if missing, links it
 through torch cpp_extension, and caches the module. Non-gfx906 machines and
 ineligible shapes (dtype/head_dim/masks) fall back to stock attention.
 
-## conv3d backend for comfy_kitchen (VAE decode)
+The optional `SEEDVR2_GFX906_VAE=1` hook also intercepts PyTorch VAE attention.
+It stays off by default: on the tested VAE attention shapes, the gfx906 kernel
+was slower than PyTorch math SDPA. The DiT attention hook is unaffected.
+
+## conv3d backend for comfy_kitchen (VAE)
 
 `gfx906_kitchen.py` + `hip_conv/` implement a `gfx906` backend registered into
-comfy_kitchen's registry, serving fp16_conv3d for the SeedVR2 VAE decoder -
-comfy_kitchen's stock HIP manifest has no gfx906 ops at all, so the VAE decode
-otherwise runs the eager NCDHW path (~95min of a ~2h batch).
+comfy_kitchen's registry, serving fp16_conv3d for the SeedVR2 VAE -
+comfy_kitchen's stock HIP manifest has no gfx906 ops, so unsupported paths
+otherwise run the eager NCDHW implementation.
 
 Deploy to your ComfyUI node:
 
@@ -70,6 +74,7 @@ Requires comfy_kitchen (pip) installed in the ComfyUI venv and a gfx906 GPU;
 anything outside the envelope (C/K not multiples of 8, non-fp16, odd strides)
 falls back to the stock torch path.
 
-Status: hardware-validated on gfx906 - 17/17 test_conv3d.py cases correct vs
-fp32 torch conv3d. In-node deployment is up; real-decode end-to-end timing
-still pending.
+On tested gfx906 VAE convolution shapes, hoisting repeated integer division
+improved kernel throughput by up to approximately 1.8x versus the previous
+kernel. All 17 `test_conv3d.py` correctness cases passed against fp32 torch
+conv3d. The end-to-end workflow impact of this optimization remains unmeasured.
